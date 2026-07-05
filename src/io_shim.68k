@@ -1,0 +1,36 @@
+| =====================================================================
+| io_shim.68k - z80_interp.68k calls Z80_IO_READ/Z80_IO_WRITE with a
+| fixed register convention (d0.w=address in, d1.b=value in/out;
+| everything else preserved, since that's what its own leaf routines
+| do). Plain C functions compiled by SGDK's toolchain don't speak that
+| convention, so this tiny shim adapts between the two, using classic
+| stack-based argument passing (the safe, portable default for m68k
+| GCC without special calling-convention attributes).
+|
+| VERIFY FIRST BUILD: if SGDK's specific GCC build passes small
+| arguments in registers instead of on the stack (some homebrew m68k
+| toolchains do, for speed), this file is the one place to fix - the
+| C side (commando_io.c) doesn't need to change either way.
+| =====================================================================
+
+	.text
+	.global	Z80_IO_READ
+	.global	Z80_IO_WRITE
+	.extern	commando_io_read
+	.extern	commando_io_write
+
+Z80_IO_READ:				| in: d0.w=addr  out: d1.b=value
+	move.w	d0,-(a7)
+	jsr	commando_io_read
+	addq.l	#2,a7
+	move.b	d0,d1
+	rts
+
+Z80_IO_WRITE:				| in: d0.w=addr, d1.b=value
+	moveq	#0,d2
+	move.b	d1,d2
+	move.w	d2,-(a7)		| 2nd C arg (value), pushed first
+	move.w	d0,-(a7)		| 1st C arg (addr)
+	jsr	commando_io_write
+	addq.l	#4,a7
+	rts

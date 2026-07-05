@@ -1,0 +1,96 @@
+| =====================================================================
+| header.68k - Mega Drive cartridge header + 68000 vector table.
+| Standard boilerplate (same shape as any bare-metal MD ROM / the
+| header used by the Xevious MD port referenced in this project).
+| =====================================================================
+
+	.text
+	.long	_start			| 0x000 reset: initial SP (we don't use this
+					| slot for SP - see note below, TMSS-era
+					| carts set SP via the second vector)
+	.long	_start			| 0x004 reset: initial PC
+
+	.long	Exception_Error		| 0x008 bus error
+	.long	Exception_Error		| 0x00C address error
+	.long	Exception_Error		| 0x010 illegal instruction
+	.long	Exception_Error		| 0x014 zero divide
+	.long	Exception_Error		| 0x018 CHK
+	.long	Exception_Error		| 0x01C TRAPV
+	.long	Exception_Error		| 0x020 privilege violation
+	.long	Exception_Error		| 0x024 trace
+	.long	Exception_Error		| 0x028 line 1010
+	.long	Exception_Error		| 0x02C line 1111
+	.long	Exception_Error		| 0x030 reserved
+	.long	Exception_Error		| 0x034 reserved
+	.long	Exception_Error		| 0x038 reserved
+	.long	Exception_Error		| 0x03C reserved
+	.long	Exception_Error		| 0x040 reserved
+	.long	Exception_Error		| 0x044 reserved
+	.long	Exception_Error		| 0x048 reserved
+	.long	Exception_Error		| 0x04C reserved
+	.long	Exception_Error		| 0x050 reserved
+	.long	Exception_Error		| 0x054 reserved
+	.long	Exception_Error		| 0x058 reserved
+	.long	Exception_Error		| 0x05C reserved
+	.long	Exception_Error		| 0x060 spurious
+	.long	Int_Level1		| 0x064 IRQ1 (unused on MD)
+	.long	Int_Level2		| 0x068 IRQ2 (external / EXT)
+	.long	Int_Level3		| 0x06C IRQ3 (unused)
+	.long	Int_HBlank		| 0x070 IRQ4 (H-blank)
+	.long	Int_Level5		| 0x074 IRQ5 (unused)
+	.long	Int_VBlank		| 0x078 IRQ6 (V-blank - our main frame tick)
+	.long	Int_Level7		| 0x07C IRQ7 (unused)
+	.long	Exception_Error		| 0x080 TRAP #0
+	.long	Exception_Error		| 0x084 TRAP #1
+	.long	Exception_Error		| 0x088 TRAP #2
+	.long	Exception_Error		| 0x08C TRAP #3
+	.long	Exception_Error		| 0x090 TRAP #4
+	.long	Exception_Error		| 0x094 TRAP #5
+	.long	Exception_Error		| 0x098 TRAP #6
+	.long	Exception_Error		| 0x09C TRAP #7
+	.long	Exception_Error		| 0x0A0 TRAP #8
+	.long	Exception_Error		| 0x0A4 TRAP #9
+	.long	Exception_Error		| 0x0A8 TRAP #10
+	.long	Exception_Error		| 0x0AC TRAP #11
+	.long	Exception_Error		| 0x0B0 TRAP #12
+	.long	Exception_Error		| 0x0B4 TRAP #13
+	.long	Exception_Error		| 0x0B8 TRAP #14
+	.long	Exception_Error		| 0x0BC TRAP #15
+	.long	Exception_Error		| 0x0C0-0x0FC reserved (16 slots)
+	.long	Exception_Error
+	.long	Exception_Error
+	.long	Exception_Error
+	.long	Exception_Error
+	.long	Exception_Error
+	.long	Exception_Error
+	.long	Exception_Error
+	.long	Exception_Error
+	.long	Exception_Error
+	.long	Exception_Error
+	.long	Exception_Error
+	.long	Exception_Error
+	.long	Exception_Error
+	.long	Exception_Error
+	.long	Exception_Error
+
+	| ---- 256 byte cartridge header, MD BIOS reads this verbatim ----
+	.ascii	"SEGA MEGA DRIVE "			| 16
+	.ascii	"(C)2026 RAY     "			| 16
+	.ascii	"COMMANDO MD PORT - OPTION C ENGINE              "	| 48
+	.ascii	"COMMANDO MD PORT - OPTION C ENGINE              "	| 48
+	.ascii	"GM 00000000-00"			| 14 serial
+	.word	0x0000					| checksum - filled by build script post-link
+	.ascii	"J               "			| 16 device support (pad only; edit if adding 6btn etc.)
+	.long	0x00000000				| ROM start
+	.long	ROM_END-1				| ROM end (patched by linker via symbol)
+	.long	0x00FF0000				| RAM start
+	.long	0x00FFFFFF				| RAM end
+	.ascii	"            "				| 12 SRAM info (none)
+	.ascii	"            "				| 12 modem info (none)
+	.ascii	"                                        "	| 40 notes
+	.ascii	"JUE             "			| 16 region (Japan/US/Europe)
+
+	.text
+_start:
+	.global	_start
+	jmp	Startup

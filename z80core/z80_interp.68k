@@ -1,0 +1,1894 @@
+| =====================================================================
+| z80_interp.68k - generic Z80 interpreter for plain MC68000
+|
+| Not tied to Commando: the only Commando-specific things are outside
+| this file, reached through two hooks that the host project must
+| provide:
+|
+|   Z80_IO_READ   (in: d0.w = z80 address >= Z80_ROM_SIZE, out: d1.b)
+|   Z80_IO_WRITE  (in: d0.w = z80 address >= Z80_ROM_SIZE, d1.b = value)
+|
+| and one data symbol:
+|
+|   z80_rom_data  : Z80_ROM_SIZE bytes, the Z80 program ROM image
+|
+| Reusable for the other jotd-style arcade ports later (same trick
+| works for any Z80-CPU arcade board, not just Commando).
+| =====================================================================
+
+	.include "z80_defs.inc"
+
+	.text
+	.even
+
+	| parity lookup table, filled at runtime by Z80_INIT (256 bytes) -
+	| computed instead of hand-transcribed to avoid mistakes
+	.bss
+	.align	2
+PARITY_TABLE:
+	.ds.b	256
+	.text
+
+| =====================================================================
+| Z80_INIT - call once at boot. Clears registers, builds parity table.
+| =====================================================================
+	.global	Z80_INIT
+Z80_INIT:
+	movem.l	d0-d3/a0,-(a7)
+	lea	z80_af,a0
+	moveq	#0,d0
+	move.w	d0,(a0)+	| af
+	move.w	d0,(a0)+	| bc
+	move.w	d0,(a0)+	| de
+	move.w	d0,(a0)+	| hl
+	move.w	d0,(a0)+	| af2
+	move.w	d0,(a0)+	| bc2
+	move.w	d0,(a0)+	| de2
+	move.w	d0,(a0)+	| hl2
+	move.w	d0,(a0)+	| ix
+	move.w	d0,(a0)+	| iy
+	move.w	#0xFFF0,(a0)+	| sp - safe default, host can override after Z80_INIT
+	move.w	d0,(a0)+	| pc - host sets real entry point after this
+	move.w	d0,(a0)+	| ir
+	move.b	d0,z80_iff1
+	move.b	d0,z80_iff2
+	move.b	d0,z80_im
+	move.b	d0,z80_halted
+	move.b	d0,z80_int_pending
+
+	| parity table: bit(i) = 1 if byte i has EVEN number of set bits
+	| (matches Z80 P/V convention for logic ops: PV=1 means even parity)
+	lea	PARITY_TABLE,a0
+	moveq	#0,d0
+1:	moveq	#0,d1
+	move.b	d0,d2
+	moveq	#8,d3
+2:	lsr.b	#1,d2
+	bcc.s	3f
+	eor.b	#1,d1
+3:	dbra	d3,2b
+	eor.b	#1,d1		| flip: d1 was "odd count", we want "even -> 1"
+	move.b	d1,(a0)+
+	addq.w	#1,d0
+	cmp.w	#256,d0
+	bne.s	1b
+
+	movem.l	(a7)+,d0-d3/a0
+	rts
+
+| =====================================================================
+| Memory router. Everything below Z80_ROM_SIZE is the program ROM
+| (read-only, lives directly in MD cartridge space - no copy needed).
+| Everything else is handed to the host's Z80_IO_READ / Z80_IO_WRITE,
+| which is where Commando's RAM/video-RAM/sprite-RAM/ports live.
+| =====================================================================
+
+	.global	Z80_RD_BYTE
+	.global	Z80_WR_BYTE
+
+| in: d0.w = address   out: d1.b = value.  Trashes a0.
+Z80_RD_BYTE:
+	cmp.w	#Z80_ROM_SIZE,d0
+	bcc.s	.rd_io
+	lea	z80_rom_data,a0
+	move.b	(a0,d0.w),d1
+	rts
+.rd_io:
+	bra	Z80_IO_READ		| tail call, callee does rts
+
+| in: d0.w = address, d1.b = value
+Z80_WR_BYTE:
+	cmp.w	#Z80_ROM_SIZE,d0
+	bcc.s	.wr_io
+	rts			| writes to ROM area silently ignored (real HW: no-op)
+.wr_io:
+	bra	Z80_IO_WRITE
+
+	.global	Z80_RD_WORD
+	.global	Z80_WR_WORD
+
+| in: d0.w = address  out: d1.w = little-endian 16 bit value (Z80 is LE!)
+| Trashes a0/d4.
+Z80_RD_WORD:
+	move.w	d0,d4
+	bsr	Z80_RD_BYTE		| low byte first
+	move.b	d1,d3
+	move.w	d4,d0
+	addq.w	#1,d0
+	bsr	Z80_RD_BYTE		| high byte
+	lsl.w	#8,d1
+	move.b	d3,d1
+	rts
+
+| in: d0.w = address, d1.w = value (little-endian store, Z80 order)
+Z80_WR_WORD:
+	move.w	d0,d4
+	move.w	d1,d3
+	bsr	Z80_WR_BYTE		| low byte @ addr
+	move.w	d4,d0
+	addq.w	#1,d0
+	move.w	d3,d1
+	lsr.w	#8,d1
+	bsr	Z80_WR_BYTE		| high byte @ addr+1
+	rts
+
+| =====================================================================
+| 8 bit register file access by 3 bit Z80 encoding (0..7 = B C D E H L
+| (HL) A). Used by every opcode whose encoding carries a register field
+| this way - the vast majority of the instruction set.
+| GET: in d0.b (low 3 bits used) -> out d1.b.  Trashes a0 (and d0 for
+| the (HL) case, where it's needed for the memory read).
+| PUT: in d0.b (low 3 bits used), d1.b = value to store.
+| =====================================================================
+	.global	Z80_GET_R8
+	.global	Z80_PUT_R8
+
+Z80_GET_R8:
+	and.w	#7,d0
+	add.w	d0,d0
+	add.w	d0,d0
+	lea	.get_r8_tab,a0
+	movea.l	(a0,d0.w),a0
+	jmp	(a0)
+.get_r8_tab:
+	.long	.g_b,.g_c,.g_d,.g_e,.g_h,.g_l,.g_hl,.g_a
+.g_b:	move.b	z80_b,d1
+	rts
+.g_c:	move.b	z80_c,d1
+	rts
+.g_d:	move.b	z80_d,d1
+	rts
+.g_e:	move.b	z80_e,d1
+	rts
+.g_h:	move.b	z80_h,d1
+	rts
+.g_l:	move.b	z80_l,d1
+	rts
+.g_a:	move.b	z80_a,d1
+	rts
+.g_hl:	move.w	z80_hl,d0
+	bra	Z80_RD_BYTE		| tail call, callee rts's back for us
+
+Z80_PUT_R8:
+	and.w	#7,d0
+	add.w	d0,d0
+	add.w	d0,d0
+	lea	.put_r8_tab,a0
+	movea.l	(a0,d0.w),a0
+	jmp	(a0)
+.put_r8_tab:
+	.long	.p_b,.p_c,.p_d,.p_e,.p_h,.p_l,.p_hl,.p_a
+.p_b:	move.b	d1,z80_b
+	rts
+.p_c:	move.b	d1,z80_c
+	rts
+.p_d:	move.b	d1,z80_d
+	rts
+.p_e:	move.b	d1,z80_e
+	rts
+.p_h:	move.b	d1,z80_h
+	rts
+.p_l:	move.b	d1,z80_l
+	rts
+.p_a:	move.b	d1,z80_a
+	rts
+.p_hl:	move.w	z80_hl,d0
+	bra	Z80_WR_BYTE
+
+| =====================================================================
+| 16 bit register pair access. Z80 has two different 2-bit encodings
+| depending on instruction group:
+|   ss/dd table = BC,DE,HL,SP   (LD dd,nn / INC ss / DEC ss / ADD HL,ss)
+|   qq table    = BC,DE,HL,AF   (PUSH qq / POP qq)
+| =====================================================================
+	.global	Z80_GET_SS16
+	.global	Z80_PUT_SS16
+	.global	Z80_GET_QQ16
+	.global	Z80_PUT_QQ16
+
+Z80_GET_SS16:
+	and.w	#3,d0
+	add.w	d0,d0
+	add.w	d0,d0
+	lea	.getss_tab,a0
+	movea.l	(a0,d0.w),a0
+	jmp	(a0)
+.getss_tab:
+	.long	.gs_bc,.gs_de,.gs_hl,.gs_sp
+.gs_bc:	move.w	z80_bc,d1
+	rts
+.gs_de:	move.w	z80_de,d1
+	rts
+.gs_hl:	move.w	z80_hl,d1
+	rts
+.gs_sp:	move.w	z80_sp,d1
+	rts
+
+Z80_PUT_SS16:
+	and.w	#3,d0
+	add.w	d0,d0
+	add.w	d0,d0
+	lea	.putss_tab,a0
+	movea.l	(a0,d0.w),a0
+	jmp	(a0)
+.putss_tab:
+	.long	.ps_bc,.ps_de,.ps_hl,.ps_sp
+.ps_bc:	move.w	d1,z80_bc
+	rts
+.ps_de:	move.w	d1,z80_de
+	rts
+.ps_hl:	move.w	d1,z80_hl
+	rts
+.ps_sp:	move.w	d1,z80_sp
+	rts
+
+Z80_GET_QQ16:
+	and.w	#3,d0
+	add.w	d0,d0
+	add.w	d0,d0
+	lea	.getqq_tab,a0
+	movea.l	(a0,d0.w),a0
+	jmp	(a0)
+.getqq_tab:
+	.long	.gq_bc,.gq_de,.gq_hl,.gq_af
+.gq_bc:	move.w	z80_bc,d1
+	rts
+.gq_de:	move.w	z80_de,d1
+	rts
+.gq_hl:	move.w	z80_hl,d1
+	rts
+.gq_af:	move.w	z80_af,d1
+	rts
+
+Z80_PUT_QQ16:
+	and.w	#3,d0
+	add.w	d0,d0
+	add.w	d0,d0
+	lea	.putqq_tab,a0
+	movea.l	(a0,d0.w),a0
+	jmp	(a0)
+.putqq_tab:
+	.long	.pq_bc,.pq_de,.pq_hl,.pq_af
+.pq_bc:	move.w	d1,z80_bc
+	rts
+.pq_de:	move.w	d1,z80_de
+	rts
+.pq_hl:	move.w	d1,z80_hl
+	rts
+.pq_af:	move.w	d1,z80_af
+	rts
+
+| =====================================================================
+| PUSH / POP 16 bit helper (stack grows down, matches Z80 semantics)
+| =====================================================================
+	.global	Z80_PUSH16
+	.global	Z80_POP16
+
+Z80_PUSH16:				| in: d1.w = value
+	move.w	z80_sp,d0
+	subq.w	#2,d0
+	move.w	d0,z80_sp
+	bra	Z80_WR_WORD
+
+Z80_POP16:				| out: d1.w = value
+	move.w	z80_sp,d0
+	bsr	Z80_RD_WORD
+	move.w	z80_sp,d0
+	addq.w	#2,d0
+	move.w	d0,z80_sp
+	rts
+
+| =====================================================================
+| 8 bit ALU group: ADD/ADC/SUB/SBC/AND/XOR/OR/CP A,operand
+| Entered with the operand already fetched into d1.b, and d0.w =
+| op index 0..7 (bits 5-3 of the opcode). Flag rules match real
+| hardware except CP's undocumented Y/X, which we take from the
+| result rather than the operand (documented simplification - verify
+| against zexall if a game ever depends on it, unlikely).
+| =====================================================================
+	.global	Z80_ALU_DISPATCH
+Z80_ALU_DISPATCH:
+	and.w	#7,d0
+	add.w	d0,d0
+	add.w	d0,d0
+	lea	.alu_tab,a0
+	movea.l	(a0,d0.w),a0
+	jmp	(a0)
+.alu_tab:
+	.long	ALU_ADD,ALU_ADC,ALU_SUB,ALU_SBC,ALU_AND,ALU_XOR,ALU_OR,ALU_CP
+
+ALU_ADD:
+	move.b	d1,d5
+	move.b	z80_a,d4
+	move.b	d4,d1
+	add.b	d5,d1
+	Z80_FLAGS_FROM_SR d1,b
+	Z80_HALFCARRY d4,d5,d1
+	move.b	d3,z80_f
+	move.b	d1,z80_a
+	rts
+
+ALU_ADC:
+	move.b	d1,d5
+	move.b	z80_a,d4
+	Z80_CARRYIN_TO_X
+	move.b	d4,d1
+	addx.b	d5,d1
+	Z80_FLAGS_FROM_SR d1,b
+	Z80_HALFCARRY d4,d5,d1
+	move.b	d3,z80_f
+	move.b	d1,z80_a
+	rts
+
+ALU_SUB:
+	move.b	d1,d5
+	move.b	z80_a,d4
+	move.b	d4,d1
+	sub.b	d5,d1
+	Z80_FLAGS_FROM_SR d1,b
+	bset	#1,d3
+	Z80_HALFCARRY d4,d5,d1
+	move.b	d3,z80_f
+	move.b	d1,z80_a
+	rts
+
+ALU_SBC:
+	move.b	d1,d5
+	move.b	z80_a,d4
+	Z80_CARRYIN_TO_X
+	move.b	d4,d1
+	subx.b	d5,d1
+	Z80_FLAGS_FROM_SR d1,b
+	bset	#1,d3
+	Z80_HALFCARRY d4,d5,d1
+	move.b	d3,z80_f
+	move.b	d1,z80_a
+	rts
+
+ALU_CP:
+	move.b	d1,d5
+	move.b	z80_a,d4
+	move.b	d4,d1
+	sub.b	d5,d1
+	Z80_FLAGS_FROM_SR d1,b
+	bset	#1,d3
+	Z80_HALFCARRY d4,d5,d1
+	move.b	d3,z80_f
+	rts				| A unchanged - CP only sets flags
+
+ALU_AND:
+	move.b	d1,d5
+	move.b	z80_a,d1
+	and.b	d5,d1
+	moveq	#0,d3
+	tst.b	d1
+	bpl.s	1f
+	bset	#7,d3
+1:
+	bne.s	2f
+	bset	#6,d3
+2:
+	bset	#4,d3			| Z80: H always set after AND
+	move.b	d1,d2
+	and.b	#0x28,d2
+	or.b	d2,d3
+	move.b	d1,z80_a
+	Z80_PARITY_INTO_D3
+	move.b	d3,z80_f
+	rts
+
+ALU_XOR:
+	move.b	d1,d5
+	move.b	z80_a,d1
+	eor.b	d5,d1
+	moveq	#0,d3
+	tst.b	d1
+	bpl.s	1f
+	bset	#7,d3
+1:
+	bne.s	2f
+	bset	#6,d3
+2:
+	move.b	d1,d2
+	and.b	#0x28,d2
+	or.b	d2,d3
+	move.b	d1,z80_a
+	Z80_PARITY_INTO_D3
+	move.b	d3,z80_f
+	rts
+
+ALU_OR:
+	move.b	d1,d5
+	move.b	z80_a,d1
+	or.b	d5,d1
+	moveq	#0,d3
+	tst.b	d1
+	bpl.s	1f
+	bset	#7,d3
+1:
+	bne.s	2f
+	bset	#6,d3
+2:
+	move.b	d1,d2
+	and.b	#0x28,d2
+	or.b	d2,d3
+	move.b	d1,z80_a
+	Z80_PARITY_INTO_D3
+	move.b	d3,z80_f
+	rts
+
+| opcode 0x80-0xBF: ALU A,r    (r field = bits 2-0, op field = bits 5-3)
+	.global	OP_ALU_R
+OP_ALU_R:
+	move.b	d6,d0
+	and.w	#7,d0
+	bsr	Z80_GET_R8		| d1.b = operand
+	move.b	d6,d0
+	lsr.b	#3,d0
+	and.w	#7,d0
+	bra	Z80_ALU_DISPATCH
+
+| opcode 0xC6/CE/D6/DE/E6/EE/F6/FE: ALU A,n
+	.global	OP_ALU_N
+OP_ALU_N:
+	move.w	z80_pc,d0
+	bsr	Z80_RD_BYTE
+	move.w	z80_pc,d0
+	addq.w	#1,d0
+	move.w	d0,z80_pc
+	move.b	d6,d0
+	lsr.b	#3,d0
+	and.w	#7,d0
+	bra	Z80_ALU_DISPATCH
+
+| =====================================================================
+| INC/DEC r8 (opcodes x4/x5 pattern, reg field = bits 5-3). Also
+| transparently covers INC/DEC (HL) since GET/PUT_R8 routes reg==6
+| through memory.
+| =====================================================================
+	.global	OP_INC_R8
+OP_INC_R8:
+	move.b	d6,d0
+	lsr.b	#3,d0
+	and.w	#7,d0
+	bsr	Z80_GET_R8
+	move.b	d1,d4
+	addq.b	#1,d1
+	Z80_FLAGS_FROM_SR d1,b
+	move.b	z80_f,d2
+	and.b	#FLAG_C,d2
+	or.b	d2,d3			| INC does not touch C - keep old value
+	Z80_HALFCARRY d4,#1,d1
+	move.b	d3,z80_f
+	move.b	d6,d0
+	lsr.b	#3,d0
+	and.w	#7,d0
+	bra	Z80_PUT_R8
+
+	.global	OP_DEC_R8
+OP_DEC_R8:
+	move.b	d6,d0
+	lsr.b	#3,d0
+	and.w	#7,d0
+	bsr	Z80_GET_R8
+	move.b	d1,d4
+	subq.b	#1,d1
+	Z80_FLAGS_FROM_SR d1,b
+	bset	#1,d3
+	move.b	z80_f,d2
+	and.b	#FLAG_C,d2
+	or.b	d2,d3
+	Z80_HALFCARRY d4,#1,d1
+	move.b	d3,z80_f
+	move.b	d6,d0
+	lsr.b	#3,d0
+	and.w	#7,d0
+	bra	Z80_PUT_R8
+
+| =====================================================================
+| 16 bit INC/DEC ss - no flags affected at all in Z80.
+| opcode bits 5-4 select ss (00=BC 01=DE 10=HL 11=SP); bit0 of the low
+| nibble group (already baked into which OPTAB slot points here).
+| =====================================================================
+	.global	OP_INC_BC,OP_DEC_BC,OP_INC_DE,OP_DEC_DE
+	.global	OP_INC_HL,OP_DEC_HL,OP_INC_SP,OP_DEC_SP
+OP_INC_BC:
+	addq.w	#1,z80_bc
+	rts
+OP_DEC_BC:
+	subq.w	#1,z80_bc
+	rts
+OP_INC_DE:
+	addq.w	#1,z80_de
+	rts
+OP_DEC_DE:
+	subq.w	#1,z80_de
+	rts
+OP_INC_HL:
+	addq.w	#1,z80_hl
+	rts
+OP_DEC_HL:
+	subq.w	#1,z80_hl
+	rts
+OP_INC_SP:
+	addq.w	#1,z80_sp
+	rts
+OP_DEC_SP:
+	subq.w	#1,z80_sp
+	rts
+
+| =====================================================================
+| ADD HL,ss (0x09/19/29/39). Affects H,N(=0),C + undoc Y/X from result
+| high byte. Leaves S,Z,PV untouched (real Z80 quirk).
+| =====================================================================
+	.global	OP_ADD_HL_SS
+OP_ADD_HL_SS:
+	move.b	d6,d0
+	lsr.b	#4,d0
+	and.w	#3,d0
+	bsr	Z80_GET_SS16		| d1.w = ss value
+	move.w	z80_hl,d4
+	move.w	d1,d5
+	move.w	d4,d1
+	add.w	d5,d1
+	moveq	#0,d3
+	bcc.s	1f
+	bset	#0,d3
+1:
+	move.w	d4,d2
+	eor.w	d5,d2
+	eor.w	d1,d2
+	btst	#12,d2
+	beq.s	2f
+	bset	#4,d3
+2:
+	move.b	d1,d2
+	and.b	#0x28,d2
+	or.b	d2,d3
+	move.b	z80_f,d2
+	and.b	#0xC4,d2		| FLAG_S|FLAG_Z|FLAG_PV
+	or.b	d2,d3
+	move.b	d3,z80_f
+	move.w	d1,z80_hl
+	rts
+
+| =====================================================================
+| 16 bit / misc loads
+| =====================================================================
+	.global	OP_LD_DD_NN
+OP_LD_DD_NN:
+	move.w	z80_pc,d0
+	bsr	Z80_RD_WORD
+	move.w	z80_pc,d0
+	addq.w	#2,d0
+	move.w	d0,z80_pc
+	move.b	d6,d0
+	lsr.b	#4,d0
+	and.w	#3,d0
+	bra	Z80_PUT_SS16
+
+	.global	OP_LD_BC_A,OP_LD_DE_A,OP_LD_A_BC,OP_LD_A_DE
+OP_LD_BC_A:
+	move.w	z80_bc,d0
+	move.b	z80_a,d1
+	bra	Z80_WR_BYTE
+OP_LD_DE_A:
+	move.w	z80_de,d0
+	move.b	z80_a,d1
+	bra	Z80_WR_BYTE
+OP_LD_A_BC:
+	move.w	z80_bc,d0
+	bsr	Z80_RD_BYTE
+	move.b	d1,z80_a
+	rts
+OP_LD_A_DE:
+	move.w	z80_de,d0
+	bsr	Z80_RD_BYTE
+	move.b	d1,z80_a
+	rts
+
+	.global	OP_LD_NN_HL,OP_LD_HL_NN,OP_LD_NN_A,OP_LD_A_NN
+OP_LD_NN_HL:
+	move.w	z80_pc,d0
+	bsr	Z80_RD_WORD
+	move.w	z80_pc,d0
+	addq.w	#2,d0
+	move.w	d0,z80_pc
+	move.w	d1,d0
+	move.w	z80_hl,d1
+	bra	Z80_WR_WORD
+OP_LD_HL_NN:
+	move.w	z80_pc,d0
+	bsr	Z80_RD_WORD
+	move.w	z80_pc,d0
+	addq.w	#2,d0
+	move.w	d0,z80_pc
+	move.w	d1,d0
+	bsr	Z80_RD_WORD
+	move.w	d1,z80_hl
+	rts
+OP_LD_NN_A:
+	move.w	z80_pc,d0
+	bsr	Z80_RD_WORD
+	move.w	z80_pc,d0
+	addq.w	#2,d0
+	move.w	d0,z80_pc
+	move.w	d1,d0
+	move.b	z80_a,d1
+	bra	Z80_WR_BYTE
+OP_LD_A_NN:
+	move.w	z80_pc,d0
+	bsr	Z80_RD_WORD
+	move.w	z80_pc,d0
+	addq.w	#2,d0
+	move.w	d0,z80_pc
+	move.w	d1,d0
+	bsr	Z80_RD_BYTE
+	move.b	d1,z80_a
+	rts
+
+	.global	OP_LD_R_N
+OP_LD_R_N:
+	move.w	z80_pc,d0
+	bsr	Z80_RD_BYTE
+	move.w	z80_pc,d0
+	addq.w	#1,d0
+	move.w	d0,z80_pc
+	move.b	d6,d0
+	lsr.b	#3,d0
+	and.w	#7,d0
+	bra	Z80_PUT_R8
+
+	.global	OP_LD_R_R
+OP_LD_R_R:
+	move.b	d6,d0
+	and.w	#7,d0
+	bsr	Z80_GET_R8
+	move.b	d6,d0
+	lsr.b	#3,d0
+	and.w	#7,d0
+	bra	Z80_PUT_R8
+
+	.global	OP_LD_SP_HL
+OP_LD_SP_HL:
+	move.w	z80_hl,z80_sp
+	rts
+
+	.global	OP_PUSH_QQ,OP_POP_QQ
+OP_PUSH_QQ:
+	move.b	d6,d0
+	lsr.b	#4,d0
+	and.w	#3,d0
+	bsr	Z80_GET_QQ16
+	bra	Z80_PUSH16
+OP_POP_QQ:
+	bsr	Z80_POP16
+	move.b	d6,d0
+	lsr.b	#4,d0
+	and.w	#3,d0
+	bra	Z80_PUT_QQ16
+
+	.global	OP_EX_DE_HL,OP_EX_AF_AF2,OP_EXX,OP_EX_SP_HL
+OP_EX_DE_HL:
+	move.w	z80_de,d0
+	move.w	z80_hl,d1
+	move.w	d1,z80_de
+	move.w	d0,z80_hl
+	rts
+OP_EX_AF_AF2:
+	move.w	z80_af,d0
+	move.w	z80_af2,d1
+	move.w	d1,z80_af
+	move.w	d0,z80_af2
+	rts
+OP_EXX:
+	move.w	z80_bc,d0
+	move.w	z80_bc2,d1
+	move.w	d1,z80_bc
+	move.w	d0,z80_bc2
+	move.w	z80_de,d0
+	move.w	z80_de2,d1
+	move.w	d1,z80_de
+	move.w	d0,z80_de2
+	move.w	z80_hl,d0
+	move.w	z80_hl2,d1
+	move.w	d1,z80_hl
+	move.w	d0,z80_hl2
+	rts
+OP_EX_SP_HL:
+	move.w	z80_sp,d0
+	bsr	Z80_RD_WORD
+	move.w	d1,d4
+	move.w	z80_sp,d0
+	move.w	z80_hl,d1
+	bsr	Z80_WR_WORD
+	move.w	d4,z80_hl
+	rts
+
+| =====================================================================
+| Accumulator rotates (RLCA/RRCA/RLA/RRA) - unlike the CB-prefixed
+| rotate group, these leave S/Z/PV untouched.
+| =====================================================================
+	.global	OP_RLCA,OP_RRCA,OP_RLA,OP_RRA
+OP_RLCA:
+	move.b	z80_a,d1
+	rol.b	#1,d1
+	moveq	#0,d3
+	bcc.s	1f
+	bset	#0,d3
+1:
+	move.b	d1,d2
+	and.b	#0x28,d2
+	or.b	d2,d3
+	move.b	z80_f,d2
+	and.b	#0xC4,d2
+	or.b	d2,d3
+	move.b	d3,z80_f
+	move.b	d1,z80_a
+	rts
+OP_RRCA:
+	move.b	z80_a,d1
+	ror.b	#1,d1
+	moveq	#0,d3
+	bcc.s	1f
+	bset	#0,d3
+1:
+	move.b	d1,d2
+	and.b	#0x28,d2
+	or.b	d2,d3
+	move.b	z80_f,d2
+	and.b	#0xC4,d2
+	or.b	d2,d3
+	move.b	d3,z80_f
+	move.b	d1,z80_a
+	rts
+OP_RLA:
+	Z80_CARRYIN_TO_X
+	move.b	z80_a,d1
+	roxl.b	#1,d1
+	moveq	#0,d3
+	bcc.s	1f
+	bset	#0,d3
+1:
+	move.b	d1,d2
+	and.b	#0x28,d2
+	or.b	d2,d3
+	move.b	z80_f,d2
+	and.b	#0xC4,d2
+	or.b	d2,d3
+	move.b	d3,z80_f
+	move.b	d1,z80_a
+	rts
+OP_RRA:
+	Z80_CARRYIN_TO_X
+	move.b	z80_a,d1
+	roxr.b	#1,d1
+	moveq	#0,d3
+	bcc.s	1f
+	bset	#0,d3
+1:
+	move.b	d1,d2
+	and.b	#0x28,d2
+	or.b	d2,d3
+	move.b	z80_f,d2
+	and.b	#0xC4,d2
+	or.b	d2,d3
+	move.b	d3,z80_f
+	move.b	d1,z80_a
+	rts
+
+| =====================================================================
+| CPL / SCF / CCF / DAA / NOP / HALT / DI / EI
+| =====================================================================
+	.global	OP_CPL,OP_SCF,OP_CCF,OP_DAA,OP_NOP,OP_HALT,OP_DI,OP_EI
+OP_CPL:
+	move.b	z80_a,d1
+	not.b	d1
+	move.b	d1,z80_a
+	move.b	z80_f,d3
+	and.b	#0xC5,d3		| keep S,Z,PV,C
+	bset	#1,d3			| N=1
+	bset	#4,d3			| H=1
+	move.b	d1,d2
+	and.b	#0x28,d2
+	or.b	d2,d3
+	move.b	d3,z80_f
+	rts
+OP_SCF:
+	move.b	z80_f,d3
+	and.b	#0xC4,d3		| keep S,Z,PV
+	bset	#0,d3			| C=1
+	move.b	z80_a,d2
+	and.b	#0x28,d2
+	or.b	d2,d3
+	move.b	d3,z80_f
+	rts
+OP_CCF:
+	move.b	z80_f,d3
+	move.b	d3,d4
+	and.b	#0xC4,d3		| keep S,Z,PV
+	and.b	#1,d4
+	beq.s	1f
+	bset	#4,d3			| old C=1 -> H=1, C->0
+	bra.s	2f
+1:
+	bset	#0,d3			| old C=0 -> C=1, H=0
+2:
+	move.b	z80_a,d2
+	and.b	#0x28,d2
+	or.b	d2,d3
+	move.b	d3,z80_f
+	rts
+OP_NOP:
+	rts
+OP_HALT:
+	move.b	#1,z80_halted
+	rts
+OP_DI:
+	clr.b	z80_iff1
+	clr.b	z80_iff2
+	rts
+OP_EI:
+	move.b	#1,z80_iff1
+	move.b	#1,z80_iff2
+	rts			| simplification: real HW delays enable by 1 instr; not modeled
+
+OP_DAA:
+	move.b	z80_a,d6		| d6 free here (opcode has no sub-fields for DAA)
+	move.b	z80_a,d1
+	move.b	z80_f,d4
+	moveq	#0,d5
+	btst	#1,d4
+	bne.s	.daa_sub
+.daa_add:
+	btst	#4,d4
+	bne.s	.aa_lo
+	move.b	d1,d2
+	and.b	#0x0F,d2
+	cmp.b	#9,d2
+	bls.s	.aa_hi
+.aa_lo:
+	add.b	#6,d1
+.aa_hi:
+	btst	#0,d4
+	bne.s	.aa_hc
+	cmp.b	#0x99,d1
+	bls.s	.daa_flags
+.aa_hc:
+	add.b	#0x60,d1
+	moveq	#1,d5
+	bra.s	.daa_flags
+.daa_sub:
+	btst	#4,d4
+	beq.s	.sb_hi
+	sub.b	#6,d1
+.sb_hi:
+	btst	#0,d4
+	beq.s	.daa_flags
+	sub.b	#0x60,d1
+	moveq	#1,d5
+.daa_flags:
+	moveq	#0,d3
+	tst.b	d1
+	bpl.s	.df1
+	bset	#7,d3
+.df1:
+	bne.s	.df2
+	bset	#6,d3
+.df2:
+	tst.b	d5
+	beq.s	.df3
+	bset	#0,d3
+.df3:
+	btst	#1,d4
+	beq.s	.df4
+	bset	#1,d3
+.df4:
+	move.b	d6,d2
+	eor.b	d1,d2
+	and.b	#0x10,d2
+	beq.s	.df5
+	bset	#4,d3
+.df5:
+	move.b	d1,d2
+	and.b	#0x28,d2
+	or.b	d2,d3
+	Z80_PARITY_INTO_D3
+	move.b	d3,z80_f
+	move.b	d1,z80_a
+	rts
+
+| =====================================================================
+| Condition tester for JP/JR/CALL/RET cc. in: d0.w = cc (0..7) mapping
+| NZ,Z,NC,C,PO,PE,P,M. out: d1.b = 1/0. Trashes d2.
+| =====================================================================
+	.global	Z80_TEST_CC
+Z80_TEST_CC:
+	and.w	#7,d0
+	move.b	z80_f,d2
+	moveq	#0,d1
+	cmp.w	#0,d0
+	bne.s	.tc1
+	btst	#6,d2
+	bne.s	.tc_false
+	bra.s	.tc_true
+.tc1:
+	cmp.w	#1,d0
+	bne.s	.tc2
+	btst	#6,d2
+	beq.s	.tc_false
+	bra.s	.tc_true
+.tc2:
+	cmp.w	#2,d0
+	bne.s	.tc3
+	btst	#0,d2
+	bne.s	.tc_false
+	bra.s	.tc_true
+.tc3:
+	cmp.w	#3,d0
+	bne.s	.tc4
+	btst	#0,d2
+	beq.s	.tc_false
+	bra.s	.tc_true
+.tc4:
+	cmp.w	#4,d0
+	bne.s	.tc5
+	btst	#2,d2
+	bne.s	.tc_false
+	bra.s	.tc_true
+.tc5:
+	cmp.w	#5,d0
+	bne.s	.tc6
+	btst	#2,d2
+	beq.s	.tc_false
+	bra.s	.tc_true
+.tc6:
+	cmp.w	#6,d0
+	bne.s	.tc7
+	btst	#7,d2
+	bne.s	.tc_false
+	bra.s	.tc_true
+.tc7:
+	btst	#7,d2
+	beq.s	.tc_false
+.tc_true:
+	moveq	#1,d1
+	rts
+.tc_false:
+	rts
+
+| =====================================================================
+| Jumps / calls / returns / RST
+| =====================================================================
+	.global	OP_JP_NN,OP_JP_CC_NN,OP_JP_HL
+OP_JP_NN:
+	move.w	z80_pc,d0
+	bsr	Z80_RD_WORD
+	move.w	d1,z80_pc
+	rts
+OP_JP_CC_NN:
+	move.b	d6,d0
+	lsr.b	#3,d0
+	and.w	#7,d0
+	bsr	Z80_TEST_CC
+	move.b	d1,d4
+	move.w	z80_pc,d0
+	bsr	Z80_RD_WORD
+	move.w	z80_pc,d0
+	addq.w	#2,d0
+	move.w	d0,z80_pc
+	tst.b	d4
+	beq.s	1f
+	move.w	d1,z80_pc
+1:
+	rts
+OP_JP_HL:
+	move.w	z80_hl,z80_pc
+	rts
+
+	.global	OP_JR,OP_JR_CC,OP_DJNZ
+OP_JR:
+	move.w	z80_pc,d0
+	bsr	Z80_RD_BYTE
+	move.w	z80_pc,d0
+	addq.w	#1,d0
+	move.b	d1,d2
+	ext.w	d2
+	add.w	d2,d0
+	move.w	d0,z80_pc
+	rts
+OP_JR_CC:
+	move.b	d6,d0
+	lsr.b	#3,d0
+	and.w	#3,d0
+	bsr	Z80_TEST_CC
+	move.b	d1,d4
+	move.w	z80_pc,d0
+	bsr	Z80_RD_BYTE
+	move.b	d1,d5
+	move.w	z80_pc,d0
+	addq.w	#1,d0
+	move.w	d0,z80_pc
+	tst.b	d4
+	beq.s	1f
+	ext.w	d5
+	move.w	z80_pc,d0
+	add.w	d5,d0
+	move.w	d0,z80_pc
+1:
+	rts
+OP_DJNZ:
+	move.b	z80_b,d1
+	subq.b	#1,d1
+	move.b	d1,z80_b
+	move.w	z80_pc,d0
+	bsr	Z80_RD_BYTE
+	move.b	d1,d5
+	move.w	z80_pc,d0
+	addq.w	#1,d0
+	move.w	d0,z80_pc
+	tst.b	z80_b
+	beq.s	1f
+	ext.w	d5
+	move.w	z80_pc,d0
+	add.w	d5,d0
+	move.w	d0,z80_pc
+1:
+	rts
+
+	.global	OP_CALL_NN,OP_CALL_CC_NN,OP_RET,OP_RET_CC,OP_RST
+OP_CALL_NN:
+	move.w	z80_pc,d0
+	bsr	Z80_RD_WORD
+	move.w	d1,d4
+	move.w	z80_pc,d0
+	addq.w	#2,d0
+	move.w	d0,z80_pc
+	move.w	z80_pc,d1
+	bsr	Z80_PUSH16
+	move.w	d4,z80_pc
+	rts
+OP_CALL_CC_NN:
+	move.b	d6,d0
+	lsr.b	#3,d0
+	and.w	#7,d0
+	bsr	Z80_TEST_CC
+	move.b	d1,d4
+	move.w	z80_pc,d0
+	bsr	Z80_RD_WORD
+	move.w	d1,d5
+	move.w	z80_pc,d0
+	addq.w	#2,d0
+	move.w	d0,z80_pc
+	tst.b	d4
+	beq.s	1f
+	move.w	z80_pc,d1
+	bsr	Z80_PUSH16
+	move.w	d5,z80_pc
+1:
+	rts
+OP_RET:
+	bsr	Z80_POP16
+	move.w	d1,z80_pc
+	rts
+OP_RET_CC:
+	move.b	d6,d0
+	lsr.b	#3,d0
+	and.w	#7,d0
+	bsr	Z80_TEST_CC
+	tst.b	d1
+	beq.s	1f
+	bsr	Z80_POP16
+	move.w	d1,z80_pc
+1:
+	rts
+OP_RST:
+	move.w	z80_pc,d1
+	bsr	Z80_PUSH16
+	move.b	d6,d0
+	and.w	#0x38,d0
+	move.w	d0,z80_pc
+	rts
+
+| =====================================================================
+| IN A,(n) / OUT (n),A - Commando's arcade map is fully memory mapped,
+| these are likely unused, but implemented for completeness. Address
+| passed to the IO hook is synthesized as (A<<8)|n, a common Z80
+| convention some peripherals rely on for full decoding.
+| =====================================================================
+	.global	OP_IN_A_N,OP_OUT_N_A
+OP_IN_A_N:
+	move.w	z80_pc,d0
+	bsr	Z80_RD_BYTE
+	move.w	z80_pc,d0
+	addq.w	#1,d0
+	move.w	d0,z80_pc
+	moveq	#0,d0
+	move.b	d1,d0
+	move.b	z80_a,d2
+	lsl.w	#8,d2
+	or.w	d2,d0
+	bsr	Z80_IO_READ
+	move.b	d1,z80_a
+	rts
+OP_OUT_N_A:
+	move.w	z80_pc,d0
+	bsr	Z80_RD_BYTE
+	move.w	z80_pc,d0
+	addq.w	#1,d0
+	move.w	d0,z80_pc
+	moveq	#0,d0
+	move.b	d1,d0
+	move.b	z80_a,d2
+	lsl.w	#8,d2
+	or.w	d2,d0
+	move.b	z80_a,d1
+	bra	Z80_IO_WRITE
+
+| =====================================================================
+| CB prefix - rotate/shift group, BIT/RES/SET. Fully regular encoding:
+| bits7-6 = group, bits5-3 = sub-op or bit number, bits2-0 = register
+| (same 8-way B,C,D,E,H,L,(HL),A as everywhere else).
+| =====================================================================
+	.global	OP_PREFIX_CB
+OP_PREFIX_CB:
+	move.w	z80_pc,d0
+	bsr	Z80_RD_BYTE
+	move.w	z80_pc,d0
+	addq.w	#1,d0
+	move.w	d0,z80_pc
+	move.b	d1,d6			| d6 = cb-opcode (safe: outer opcode field no longer needed)
+	move.b	d6,d0
+	and.w	#7,d0
+	bsr	Z80_GET_R8		| d1.b = operand
+	move.b	d1,d4			| d4 = operand value
+	move.b	d6,d0
+	lsr.b	#6,d0
+	and.w	#3,d0
+	cmp.w	#0,d0
+	beq	CB_ROTSHIFT
+	cmp.w	#1,d0
+	beq	CB_BIT
+	cmp.w	#2,d0
+	beq	CB_RES
+	bra	CB_SET
+
+CB_ROTSHIFT:
+	move.b	d6,d0
+	lsr.b	#3,d0
+	and.w	#7,d0
+	add.w	d0,d0
+	add.w	d0,d0
+	lea	.rs_tab,a0
+	movea.l	(a0,d0.w),a0
+	move.b	d4,d1
+	jmp	(a0)
+.rs_tab:
+	.long	RS_RLC,RS_RRC,RS_RL,RS_RR,RS_SLA,RS_SRA,RS_SLL,RS_SRL
+RS_RLC:
+	rol.b	#1,d1
+	bra	CB_RS_STORE
+RS_RRC:
+	ror.b	#1,d1
+	bra	CB_RS_STORE
+RS_RL:
+	Z80_CARRYIN_TO_X
+	roxl.b	#1,d1
+	bra	CB_RS_STORE
+RS_RR:
+	Z80_CARRYIN_TO_X
+	roxr.b	#1,d1
+	bra	CB_RS_STORE
+RS_SLA:
+	lsl.b	#1,d1
+	bra	CB_RS_STORE
+RS_SRA:
+	asr.b	#1,d1
+	bra	CB_RS_STORE
+RS_SLL:					| undocumented: shift left, bit0 forced 1
+	lsl.b	#1,d1
+	bset	#0,d1
+	bra	CB_RS_STORE
+RS_SRL:
+	lsr.b	#1,d1
+	bra	CB_RS_STORE
+
+CB_RS_STORE:
+	moveq	#0,d3
+	bcc.s	1f
+	bset	#0,d3
+1:
+	tst.b	d1
+	bpl.s	2f
+	bset	#7,d3
+2:
+	bne.s	3f
+	bset	#6,d3
+3:
+	move.b	d1,d2
+	and.b	#0x28,d2
+	or.b	d2,d3
+	Z80_PARITY_INTO_D3
+	move.b	d3,z80_f
+	move.b	d6,d0
+	and.w	#7,d0
+	bra	Z80_PUT_R8
+
+CB_BIT:
+	move.b	d6,d0
+	lsr.b	#3,d0
+	and.w	#7,d0
+	moveq	#1,d5
+	move.b	d0,d2
+	lsl.b	d2,d5
+	move.b	d4,d1
+	and.b	d5,d1
+	move.b	z80_f,d3
+	and.b	#1,d3			| keep old C only
+	bset	#4,d3			| H=1
+	tst.b	d1
+	bne.s	1f
+	bset	#6,d3			| Z=1
+	bset	#2,d3			| PV mirrors Z for BIT
+1:
+	cmp.b	#7,d0
+	bne.s	2f
+	tst.b	d1
+	beq.s	2f
+	bset	#7,d3			| S set only when testing bit7 and it's set
+2:
+	move.b	d4,d2
+	and.b	#0x28,d2
+	or.b	d2,d3
+	move.b	d3,z80_f
+	rts
+
+CB_RES:
+	move.b	d6,d0
+	lsr.b	#3,d0
+	and.w	#7,d0
+	moveq	#1,d5
+	move.b	d0,d2
+	lsl.b	d2,d5
+	not.b	d5
+	move.b	d4,d1
+	and.b	d5,d1
+	move.b	d6,d0
+	and.w	#7,d0
+	bra	Z80_PUT_R8
+
+CB_SET:
+	move.b	d6,d0
+	lsr.b	#3,d0
+	and.w	#7,d0
+	moveq	#1,d5
+	move.b	d0,d2
+	lsl.b	d2,d5
+	move.b	d4,d1
+	or.b	d5,d1
+	move.b	d6,d0
+	and.w	#7,d0
+	bra	Z80_PUT_R8
+
+| =====================================================================
+| ED prefix - practical subset: block transfer/compare (LDI/LDIR/LDD/
+| LDDR/CPI/CPIR/CPD/CPDR), NEG, RETN/RETI, IM0/1/2, LD I,A/LD A,I/
+| LD R,A/LD A,R, ADC/SBC HL,ss, LD (nn),ss / LD ss,(nn), IN r,(C)/
+| OUT (C),r. Undocumented ED duplicates and INI/IND/OTIR/OTDR family
+| are NOT covered (trap to Z80_UNIMPL) - rare in 1985-era code, add
+| later if a real ROM run hits them (the trap tells you exactly where).
+| =====================================================================
+	.global	OP_PREFIX_ED
+OP_PREFIX_ED:
+	move.w	z80_pc,d0
+	bsr	Z80_RD_BYTE
+	move.w	z80_pc,d0
+	addq.w	#1,d0
+	move.w	d0,z80_pc
+	move.b	d1,d6
+	cmp.b	#0xA0,d6
+	beq	ED_LDI
+	cmp.b	#0xB0,d6
+	beq	ED_LDIR
+	cmp.b	#0xA8,d6
+	beq	ED_LDD
+	cmp.b	#0xB8,d6
+	beq	ED_LDDR
+	cmp.b	#0xA1,d6
+	beq	ED_CPI
+	cmp.b	#0xB1,d6
+	beq	ED_CPIR
+	cmp.b	#0xA9,d6
+	beq	ED_CPD
+	cmp.b	#0xB9,d6
+	beq	ED_CPDR
+	cmp.b	#0x44,d6
+	beq	ED_NEG
+	cmp.b	#0x45,d6
+	beq	ED_RETN
+	cmp.b	#0x4D,d6
+	beq	ED_RETI
+	cmp.b	#0x46,d6
+	beq	ED_IM0
+	cmp.b	#0x56,d6
+	beq	ED_IM1
+	cmp.b	#0x5E,d6
+	beq	ED_IM2
+	cmp.b	#0x47,d6
+	beq	ED_LD_I_A
+	cmp.b	#0x4F,d6
+	beq	ED_LD_R_A
+	cmp.b	#0x57,d6
+	beq	ED_LD_A_I
+	cmp.b	#0x5F,d6
+	beq	ED_LD_A_R
+	move.b	d6,d0
+	andi.b	#0xCF,d0
+	cmp.b	#0x4A,d0
+	beq	ED_ADC_HL_SS
+	cmp.b	#0x42,d0
+	beq	ED_SBC_HL_SS
+	cmp.b	#0x43,d0
+	beq	ED_LD_NN_SS
+	cmp.b	#0x4B,d0
+	beq	ED_LD_SS_NN
+	move.b	d6,d0
+	andi.b	#0xC7,d0
+	cmp.b	#0x40,d0
+	beq	ED_IN_R_C
+	cmp.b	#0x41,d0
+	beq	ED_OUT_C_R
+	bra	Z80_UNIMPL
+
+ED_LDI:
+	move.w	z80_hl,d0
+	bsr	Z80_RD_BYTE
+	move.b	d1,d4
+	move.w	z80_de,d0
+	bsr	Z80_WR_BYTE
+	addq.w	#1,z80_hl
+	addq.w	#1,z80_de
+	subq.w	#1,z80_bc
+	move.b	z80_f,d3
+	and.b	#0xC1,d3
+	move.b	z80_a,d2
+	add.b	d4,d2
+	and.b	#0x28,d2
+	or.b	d2,d3
+	tst.w	z80_bc
+	beq.s	1f
+	bset	#2,d3
+1:
+	move.b	d3,z80_f
+	rts
+ED_LDIR:
+	bsr	ED_LDI
+	tst.w	z80_bc
+	beq.s	1f
+	move.w	z80_pc,d0
+	subq.w	#2,d0
+	move.w	d0,z80_pc
+1:
+	rts
+ED_LDD:
+	move.w	z80_hl,d0
+	bsr	Z80_RD_BYTE
+	move.b	d1,d4
+	move.w	z80_de,d0
+	bsr	Z80_WR_BYTE
+	subq.w	#1,z80_hl
+	subq.w	#1,z80_de
+	subq.w	#1,z80_bc
+	move.b	z80_f,d3
+	and.b	#0xC1,d3
+	move.b	z80_a,d2
+	add.b	d4,d2
+	and.b	#0x28,d2
+	or.b	d2,d3
+	tst.w	z80_bc
+	beq.s	1f
+	bset	#2,d3
+1:
+	move.b	d3,z80_f
+	rts
+ED_LDDR:
+	bsr	ED_LDD
+	tst.w	z80_bc
+	beq.s	1f
+	move.w	z80_pc,d0
+	subq.w	#2,d0
+	move.w	d0,z80_pc
+1:
+	rts
+
+ED_CPI:
+	move.w	z80_hl,d0
+	bsr	Z80_RD_BYTE
+	move.b	d1,d5
+	move.b	z80_a,d4
+	move.b	d4,d1
+	sub.b	d5,d1
+	addq.w	#1,z80_hl
+	subq.w	#1,z80_bc
+	moveq	#0,d3
+	tst.b	d1
+	bpl.s	1f
+	bset	#7,d3
+1:
+	bne.s	2f
+	bset	#6,d3
+2:
+	bset	#1,d3
+	Z80_HALFCARRY d4,d5,d1
+	move.b	z80_f,d2
+	and.b	#1,d2
+	or.b	d2,d3
+	move.b	d1,d2
+	and.b	#0x28,d2
+	or.b	d2,d3
+	tst.w	z80_bc
+	beq.s	3f
+	bset	#2,d3
+3:
+	move.b	d3,z80_f
+	rts
+ED_CPIR:
+	bsr	ED_CPI
+	tst.w	z80_bc
+	beq.s	1f
+	btst	#6,z80_f
+	bne.s	1f
+	move.w	z80_pc,d0
+	subq.w	#2,d0
+	move.w	d0,z80_pc
+1:
+	rts
+ED_CPD:
+	move.w	z80_hl,d0
+	bsr	Z80_RD_BYTE
+	move.b	d1,d5
+	move.b	z80_a,d4
+	move.b	d4,d1
+	sub.b	d5,d1
+	subq.w	#1,z80_hl
+	subq.w	#1,z80_bc
+	moveq	#0,d3
+	tst.b	d1
+	bpl.s	1f
+	bset	#7,d3
+1:
+	bne.s	2f
+	bset	#6,d3
+2:
+	bset	#1,d3
+	Z80_HALFCARRY d4,d5,d1
+	move.b	z80_f,d2
+	and.b	#1,d2
+	or.b	d2,d3
+	move.b	d1,d2
+	and.b	#0x28,d2
+	or.b	d2,d3
+	tst.w	z80_bc
+	beq.s	3f
+	bset	#2,d3
+3:
+	move.b	d3,z80_f
+	rts
+ED_CPDR:
+	bsr	ED_CPD
+	tst.w	z80_bc
+	beq.s	1f
+	btst	#6,z80_f
+	bne.s	1f
+	move.w	z80_pc,d0
+	subq.w	#2,d0
+	move.w	d0,z80_pc
+1:
+	rts
+
+ED_NEG:
+	move.b	z80_a,d4
+	moveq	#0,d1
+	sub.b	d4,d1
+	Z80_FLAGS_FROM_SR d1,b
+	bset	#1,d3
+	moveq	#0,d5
+	Z80_HALFCARRY d5,d4,d1
+	move.b	d3,z80_f
+	move.b	d1,z80_a
+	rts
+
+ED_RETN:
+	bsr	Z80_POP16
+	move.w	d1,z80_pc
+	move.b	z80_iff2,z80_iff1
+	rts
+ED_RETI:
+	bsr	Z80_POP16
+	move.w	d1,z80_pc
+	rts
+
+ED_IM0:
+	clr.b	z80_im
+	rts
+ED_IM1:
+	move.b	#1,z80_im
+	rts
+ED_IM2:
+	move.b	#2,z80_im
+	rts
+
+ED_LD_I_A:
+	move.b	z80_a,z80_i
+	rts
+ED_LD_R_A:
+	move.b	z80_a,z80_r
+	rts
+ED_LD_A_I:
+	move.b	z80_i,d1
+	move.b	d1,z80_a
+	move.b	z80_f,d3
+	and.b	#1,d3
+	tst.b	d1
+	bpl.s	1f
+	bset	#7,d3
+1:
+	bne.s	2f
+	bset	#6,d3
+2:
+	tst.b	z80_iff2
+	beq.s	3f
+	bset	#2,d3
+3:
+	move.b	d1,d2
+	and.b	#0x28,d2
+	or.b	d2,d3
+	move.b	d3,z80_f
+	rts
+ED_LD_A_R:
+	move.b	z80_r,d1
+	move.b	d1,z80_a
+	move.b	z80_f,d3
+	and.b	#1,d3
+	tst.b	d1
+	bpl.s	1f
+	bset	#7,d3
+1:
+	bne.s	2f
+	bset	#6,d3
+2:
+	tst.b	z80_iff2
+	beq.s	3f
+	bset	#2,d3
+3:
+	move.b	d1,d2
+	and.b	#0x28,d2
+	or.b	d2,d3
+	move.b	d3,z80_f
+	rts
+
+ED_ADC_HL_SS:
+	move.b	d6,d0
+	lsr.b	#4,d0
+	and.w	#3,d0
+	bsr	Z80_GET_SS16
+	move.w	d1,d5
+	move.w	z80_hl,d4
+	Z80_CARRYIN_TO_X
+	move.w	d4,d1
+	addx.w	d5,d1
+	Z80_FLAGS_FROM_SR d1,w
+	and.b	#0xD7,d3
+	move.w	d1,d2
+	lsr.w	#8,d2
+	and.b	#0x28,d2
+	or.b	d2,d3
+	move.w	d4,d2
+	eor.w	d5,d2
+	eor.w	d1,d2
+	btst	#12,d2
+	beq.s	1f
+	bset	#4,d3
+1:
+	move.b	d3,z80_f
+	move.w	d1,z80_hl
+	rts
+
+ED_SBC_HL_SS:
+	move.b	d6,d0
+	lsr.b	#4,d0
+	and.w	#3,d0
+	bsr	Z80_GET_SS16
+	move.w	d1,d5
+	move.w	z80_hl,d4
+	Z80_CARRYIN_TO_X
+	move.w	d4,d1
+	subx.w	d5,d1
+	Z80_FLAGS_FROM_SR d1,w
+	bset	#1,d3
+	and.b	#0xD7,d3
+	move.w	d1,d2
+	lsr.w	#8,d2
+	and.b	#0x28,d2
+	or.b	d2,d3
+	move.w	d4,d2
+	eor.w	d5,d2
+	eor.w	d1,d2
+	btst	#12,d2
+	beq.s	1f
+	bset	#4,d3
+1:
+	move.b	d3,z80_f
+	move.w	d1,z80_hl
+	rts
+
+ED_LD_NN_SS:
+	move.w	z80_pc,d0
+	bsr	Z80_RD_WORD
+	move.w	d1,d4
+	move.w	z80_pc,d0
+	addq.w	#2,d0
+	move.w	d0,z80_pc
+	move.b	d6,d0
+	lsr.b	#4,d0
+	and.w	#3,d0
+	bsr	Z80_GET_SS16
+	move.w	d4,d0
+	bra	Z80_WR_WORD
+ED_LD_SS_NN:
+	move.w	z80_pc,d0
+	bsr	Z80_RD_WORD
+	move.w	d1,d4
+	move.w	z80_pc,d0
+	addq.w	#2,d0
+	move.w	d0,z80_pc
+	move.w	d4,d0
+	bsr	Z80_RD_WORD
+	move.b	d6,d0
+	lsr.b	#4,d0
+	and.w	#3,d0
+	bra	Z80_PUT_SS16
+
+ED_IN_R_C:
+	move.w	z80_bc,d0
+	bsr	Z80_IO_READ
+	move.b	d1,d4
+	move.b	z80_f,d3
+	and.b	#1,d3
+	tst.b	d4
+	bpl.s	1f
+	bset	#7,d3
+1:
+	bne.s	2f
+	bset	#6,d3
+2:
+	move.b	d4,d2
+	and.b	#0x28,d2
+	or.b	d2,d3
+	move.b	d4,d1
+	Z80_PARITY_INTO_D3
+	move.b	d3,z80_f
+	move.b	d6,d0
+	lsr.b	#3,d0
+	and.w	#7,d0
+	move.b	d4,d1
+	bra	Z80_PUT_R8
+ED_OUT_C_R:
+	move.b	d6,d0
+	lsr.b	#3,d0
+	and.w	#7,d0
+	bsr	Z80_GET_R8
+	move.b	d1,d4
+	move.w	z80_bc,d0
+	move.b	d4,d1
+	bra	Z80_IO_WRITE
+
+| =====================================================================
+| DD/FD (IX/IY) prefix - NOT YET IMPLEMENTED. Traps cleanly so a real
+| ROM run tells you exactly which PC hit it instead of corrupting
+| state silently. To implement: mirror the base dispatch but redirect
+| every "(HL)" reference to "(IX+d)"/"(IY+d)" (fetch displacement byte
+| right after the DD/FD+opcode byte) and every plain HL register
+| reference to IX/IY. Commando is a simple 1985 title; many such
+| titles use IX/IY sparingly (loop counters, table bases) - worth
+| checking how often this actually triggers before investing in it.
+| =====================================================================
+	.global	OP_PREFIX_DD,OP_PREFIX_FD
+OP_PREFIX_DD:
+OP_PREFIX_FD:
+	bra	Z80_UNIMPL
+
+| =====================================================================
+| Diagnostic trap for anything not implemented above. Freezes with the
+| offending PC (backed up to the first opcode byte of the instruction)
+| in z80_trap_pc and the raw opcode byte(s) in z80_trap_op1/op2, so a
+| debugger (BlastEm, Gens KMod, real hardware + logic analyzer) can
+| show you exactly what stopped the core.
+| =====================================================================
+	.bss
+	.align	2
+z80_trap_pc:	.ds.w	1
+z80_last_opcode: .ds.b 1
+z80_trap_op1:	.ds.b	1
+z80_trap_op2:	.ds.b	1
+	.even
+	.text
+	.global	Z80_UNIMPL
+Z80_UNIMPL:
+	move.b	d6,z80_trap_op2
+	move.w	z80_pc,z80_trap_pc
+	move.b	z80_last_opcode,z80_trap_op1
+.spin:
+	bra.s	.spin
+| ===================================================================
+| Main 256-entry opcode dispatch table (generated - see build notes
+| in the port README for the source mapping). Gaps not covered by the
+| Z80 ISA subset described there trap to Z80_UNIMPL (halts cleanly).
+| ===================================================================
+	.global	OPTAB
+OPTAB:
+	.long	OP_NOP,OP_LD_DD_NN,OP_LD_BC_A,OP_INC_BC	| 0x00-0x03
+	.long	OP_INC_R8,OP_DEC_R8,OP_LD_R_N,OP_RLCA	| 0x04-0x07
+	.long	OP_EX_AF_AF2,OP_ADD_HL_SS,OP_LD_A_BC,OP_DEC_BC	| 0x08-0x0B
+	.long	OP_INC_R8,OP_DEC_R8,OP_LD_R_N,OP_RRCA	| 0x0C-0x0F
+	.long	OP_DJNZ,OP_LD_DD_NN,OP_LD_DE_A,OP_INC_DE	| 0x10-0x13
+	.long	OP_INC_R8,OP_DEC_R8,OP_LD_R_N,OP_RLA	| 0x14-0x17
+	.long	OP_JR,OP_ADD_HL_SS,OP_LD_A_DE,OP_DEC_DE	| 0x18-0x1B
+	.long	OP_INC_R8,OP_DEC_R8,OP_LD_R_N,OP_RRA	| 0x1C-0x1F
+	.long	OP_JR_CC,OP_LD_DD_NN,OP_LD_NN_HL,OP_INC_HL	| 0x20-0x23
+	.long	OP_INC_R8,OP_DEC_R8,OP_LD_R_N,OP_DAA	| 0x24-0x27
+	.long	OP_JR_CC,OP_ADD_HL_SS,OP_LD_HL_NN,OP_DEC_HL	| 0x28-0x2B
+	.long	OP_INC_R8,OP_DEC_R8,OP_LD_R_N,OP_CPL	| 0x2C-0x2F
+	.long	OP_JR_CC,OP_LD_DD_NN,OP_LD_NN_A,OP_INC_SP	| 0x30-0x33
+	.long	OP_INC_R8,OP_DEC_R8,OP_LD_R_N,OP_SCF	| 0x34-0x37
+	.long	OP_JR_CC,OP_ADD_HL_SS,OP_LD_A_NN,OP_DEC_SP	| 0x38-0x3B
+	.long	OP_INC_R8,OP_DEC_R8,OP_LD_R_N,OP_CCF	| 0x3C-0x3F
+	.long	OP_LD_R_R,OP_LD_R_R,OP_LD_R_R,OP_LD_R_R	| 0x40-0x43
+	.long	OP_LD_R_R,OP_LD_R_R,OP_LD_R_R,OP_LD_R_R	| 0x44-0x47
+	.long	OP_LD_R_R,OP_LD_R_R,OP_LD_R_R,OP_LD_R_R	| 0x48-0x4B
+	.long	OP_LD_R_R,OP_LD_R_R,OP_LD_R_R,OP_LD_R_R	| 0x4C-0x4F
+	.long	OP_LD_R_R,OP_LD_R_R,OP_LD_R_R,OP_LD_R_R	| 0x50-0x53
+	.long	OP_LD_R_R,OP_LD_R_R,OP_LD_R_R,OP_LD_R_R	| 0x54-0x57
+	.long	OP_LD_R_R,OP_LD_R_R,OP_LD_R_R,OP_LD_R_R	| 0x58-0x5B
+	.long	OP_LD_R_R,OP_LD_R_R,OP_LD_R_R,OP_LD_R_R	| 0x5C-0x5F
+	.long	OP_LD_R_R,OP_LD_R_R,OP_LD_R_R,OP_LD_R_R	| 0x60-0x63
+	.long	OP_LD_R_R,OP_LD_R_R,OP_LD_R_R,OP_LD_R_R	| 0x64-0x67
+	.long	OP_LD_R_R,OP_LD_R_R,OP_LD_R_R,OP_LD_R_R	| 0x68-0x6B
+	.long	OP_LD_R_R,OP_LD_R_R,OP_LD_R_R,OP_LD_R_R	| 0x6C-0x6F
+	.long	OP_LD_R_R,OP_LD_R_R,OP_LD_R_R,OP_LD_R_R	| 0x70-0x73
+	.long	OP_LD_R_R,OP_LD_R_R,OP_HALT,OP_LD_R_R	| 0x74-0x77
+	.long	OP_LD_R_R,OP_LD_R_R,OP_LD_R_R,OP_LD_R_R	| 0x78-0x7B
+	.long	OP_LD_R_R,OP_LD_R_R,OP_LD_R_R,OP_LD_R_R	| 0x7C-0x7F
+	.long	OP_ALU_R,OP_ALU_R,OP_ALU_R,OP_ALU_R	| 0x80-0x83
+	.long	OP_ALU_R,OP_ALU_R,OP_ALU_R,OP_ALU_R	| 0x84-0x87
+	.long	OP_ALU_R,OP_ALU_R,OP_ALU_R,OP_ALU_R	| 0x88-0x8B
+	.long	OP_ALU_R,OP_ALU_R,OP_ALU_R,OP_ALU_R	| 0x8C-0x8F
+	.long	OP_ALU_R,OP_ALU_R,OP_ALU_R,OP_ALU_R	| 0x90-0x93
+	.long	OP_ALU_R,OP_ALU_R,OP_ALU_R,OP_ALU_R	| 0x94-0x97
+	.long	OP_ALU_R,OP_ALU_R,OP_ALU_R,OP_ALU_R	| 0x98-0x9B
+	.long	OP_ALU_R,OP_ALU_R,OP_ALU_R,OP_ALU_R	| 0x9C-0x9F
+	.long	OP_ALU_R,OP_ALU_R,OP_ALU_R,OP_ALU_R	| 0xA0-0xA3
+	.long	OP_ALU_R,OP_ALU_R,OP_ALU_R,OP_ALU_R	| 0xA4-0xA7
+	.long	OP_ALU_R,OP_ALU_R,OP_ALU_R,OP_ALU_R	| 0xA8-0xAB
+	.long	OP_ALU_R,OP_ALU_R,OP_ALU_R,OP_ALU_R	| 0xAC-0xAF
+	.long	OP_ALU_R,OP_ALU_R,OP_ALU_R,OP_ALU_R	| 0xB0-0xB3
+	.long	OP_ALU_R,OP_ALU_R,OP_ALU_R,OP_ALU_R	| 0xB4-0xB7
+	.long	OP_ALU_R,OP_ALU_R,OP_ALU_R,OP_ALU_R	| 0xB8-0xBB
+	.long	OP_ALU_R,OP_ALU_R,OP_ALU_R,OP_ALU_R	| 0xBC-0xBF
+	.long	OP_RET_CC,OP_POP_QQ,OP_JP_CC_NN,OP_JP_NN	| 0xC0-0xC3
+	.long	OP_CALL_CC_NN,OP_PUSH_QQ,OP_ALU_N,OP_RST	| 0xC4-0xC7
+	.long	OP_RET_CC,OP_RET,OP_JP_CC_NN,OP_PREFIX_CB	| 0xC8-0xCB
+	.long	OP_CALL_CC_NN,OP_CALL_NN,OP_ALU_N,OP_RST	| 0xCC-0xCF
+	.long	OP_RET_CC,OP_POP_QQ,OP_JP_CC_NN,OP_OUT_N_A	| 0xD0-0xD3
+	.long	OP_CALL_CC_NN,OP_PUSH_QQ,OP_ALU_N,OP_RST	| 0xD4-0xD7
+	.long	OP_RET_CC,OP_EXX,OP_JP_CC_NN,OP_IN_A_N	| 0xD8-0xDB
+	.long	OP_CALL_CC_NN,OP_PREFIX_DD,OP_ALU_N,OP_RST	| 0xDC-0xDF
+	.long	OP_RET_CC,OP_POP_QQ,OP_JP_CC_NN,OP_EX_SP_HL	| 0xE0-0xE3
+	.long	OP_CALL_CC_NN,OP_PUSH_QQ,OP_ALU_N,OP_RST	| 0xE4-0xE7
+	.long	OP_RET_CC,OP_JP_HL,OP_JP_CC_NN,OP_EX_DE_HL	| 0xE8-0xEB
+	.long	OP_CALL_CC_NN,OP_PREFIX_ED,OP_ALU_N,OP_RST	| 0xEC-0xEF
+	.long	OP_RET_CC,OP_POP_QQ,OP_JP_CC_NN,OP_DI	| 0xF0-0xF3
+	.long	OP_CALL_CC_NN,OP_PUSH_QQ,OP_ALU_N,OP_RST	| 0xF4-0xF7
+	.long	OP_RET_CC,OP_LD_SP_HL,OP_JP_CC_NN,OP_EI	| 0xF8-0xFB
+	.long	OP_CALL_CC_NN,OP_PREFIX_FD,OP_ALU_N,OP_RST	| 0xFC-0xFF
+
+| =====================================================================
+| Z80_RUN - main dispatch loop. in: d0.w = instruction budget for this
+| call (approximate - counts instructions, not real T-states; refine
+| once the game boots and you can measure against real timing).
+| Checks NMI (typical vblank hookup) and maskable INT before each
+| instruction. Host raises them by setting z80_nmi_pending /
+| z80_int_pending to nonzero from the 68000 side.
+| =====================================================================
+	.global	Z80_RUN
+Z80_RUN:
+	movem.l	d2-d7/a2-a6,-(a7)
+	move.w	d0,d7
+.loop:
+	tst.b	z80_halted
+	beq	.run_opcode
+	tst.b	z80_nmi_pending
+	bne	.do_nmi
+	tst.b	z80_int_pending
+	beq	.next_iter		| still halted, nothing to wake it, burn the slot
+	tst.b	z80_iff1
+	beq	.next_iter
+	bra	.do_int
+.run_opcode:
+	tst.b	z80_nmi_pending
+	bne	.do_nmi
+	tst.b	z80_int_pending
+	beq	.fetch
+	tst.b	z80_iff1
+	bne	.do_int
+.fetch:
+	move.w	z80_pc,d0
+	bsr	Z80_RD_BYTE
+	move.b	d1,z80_last_opcode	| keep raw opcode visible for Z80_UNIMPL diagnostics
+	move.w	z80_pc,d0
+	addq.w	#1,d0
+	move.w	d0,z80_pc
+	move.b	d1,d6
+	moveq	#0,d0
+	move.b	d1,d0
+	add.w	d0,d0
+	add.w	d0,d0
+	lea	OPTAB,a0
+	movea.l	(a0,d0.w),a0
+	jsr	(a0)
+	bra	.next_iter
+.do_nmi:
+	clr.b	z80_nmi_pending
+	clr.b	z80_halted
+	clr.b	z80_iff1
+	move.w	z80_pc,d1
+	bsr	Z80_PUSH16
+	move.w	#0x0066,z80_pc
+	bra	.next_iter
+.do_int:
+	clr.b	z80_int_pending
+	clr.b	z80_halted
+	clr.b	z80_iff1
+	clr.b	z80_iff2
+	move.w	z80_pc,d1
+	bsr	Z80_PUSH16
+	move.b	z80_im,d0
+	cmp.b	#2,d0
+	bne	.int_im01
+	moveq	#0,d0
+	move.b	z80_i,d0
+	lsl.w	#8,d0
+	move.b	z80_int_data,d2
+	moveq	#0,d1
+	move.b	d2,d1
+	or.w	d1,d0
+	bsr	Z80_RD_WORD
+	move.w	d1,z80_pc
+	bra	.next_iter
+.int_im01:
+	move.w	#0x0038,z80_pc
+.next_iter:
+	subq.w	#1,d7
+	bne	.loop
+	movem.l	(a7)+,d2-d7/a2-a6
+	rts

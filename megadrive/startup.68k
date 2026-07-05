@@ -1,0 +1,98 @@
+| =====================================================================
+| startup.68k - power-on init: TMSS handshake, stack, VDP setup, BSS
+| clear, then hand off to Main. Standard bare-metal MD boilerplate.
+| =====================================================================
+
+	.include "z80_defs.inc"
+
+VDP_DATA	= 0x00C00000
+VDP_CTRL	= 0x00C00004
+VDP_HVCOUNT	= 0x00C00008
+Z80_BUSREQ	= 0x00A11100
+Z80_RESET	= 0x00A11200
+TMSS_PORT	= 0x00A14000
+
+	.text
+	.global	Startup
+Startup:
+	move.w	#0x2700,sr		| interrupts off during init
+
+	| ---- TMSS handshake (required on later MD/Genesis 2 hardware) ----
+	move.b	0x00A10001,d0
+	andi.b	#0x0F,d0
+	cmpi.b	#0x0F,d0
+	beq.s	.no_tmss
+	move.l	#0x53454741,TMSS_PORT	| write "SEGA"
+.no_tmss:
+
+	lea	0x00FF0000,a0
+	move.l	a0,a7			| stack at top of work RAM, grows down
+
+	| ---- clear all of work RAM (BSS included - the Z80 state block,
+	|      video/sprite shadow tables, everything lives in here) ----
+	lea	0x00FF0000,a0
+	move.w	#0x7FFF,d0		| 64KB / 4 - 1 longwords
+.clrloop:
+	clr.l	(a0)+
+	dbra	d0,.clrloop
+
+	| ---- hold the Z80 coprocessor in reset while we set up VDP/etc,
+	|      released later once the sound driver + sound-CPU ROM image
+	|      have been DMA'd into its local RAM (see commando_map.68k) ----
+	move.w	#0x0100,Z80_BUSREQ	| request bus
+	move.w	#0x0000,Z80_RESET	| assert reset
+
+	bsr	VDP_Init
+
+	jsr	Z80_INIT		| our interpreter's own state init
+					| (main-CPU emulation, NOT the sound Z80)
+
+	move.w	#0x2000,sr		| interrupts on (VBlank drives the frame)
+	jmp	Main
+
+| =====================================================================
+| Minimal VDP init: sets display mode (H40, V28, mode5), disables
+| display until the game's own setup writes tiles/palette, sets a
+| sane default for scroll/plane base addresses. Adjust base addresses
+| here to match wherever your VRAM layout puts plane A/B/sprite tables
+| once you've ported osd_w_videoram_out et al from commando_map.68k.
+| =====================================================================
+VDP_Init:
+	movem.l	d0-d1/a0,-(a7)
+	lea	.vdp_regs,a0
+	moveq	#0,d0
+.vdp_loop:
+	move.b	(a0)+,d1
+	or.w	#0x8000,d1
+	or.w	d0,d1
+	move.w	d1,VDP_CTRL
+	addq.w	#1,d0
+	cmpi.w	#24,d0
+	bne.s	.vdp_loop
+	movem.l	(a7)+,d0-d1/a0
+	rts
+.vdp_regs:
+	.byte	0x04		| reg0: HINT off, mode4 off
+	.byte	0x74		| reg1: display OFF for now, DMA on, mode5, V28
+	.byte	0x30		| reg2: plane A base = 0xC000 (VRAM word addr>>10 -> 0x30<<10=0xC000)
+	.byte	0x00		| reg3: window base (unused, keep 0)
+	.byte	0x07		| reg4: plane B base = 0xE000 (0x07<<13)
+	.byte	0x6C		| reg5: sprite table base = 0xD800 (0x6C<<9)
+	.byte	0x00		| reg6: unused on MD
+	.byte	0x00		| reg7: background colour (palette0/entry0)
+	.byte	0x00		| reg8: unused
+	.byte	0x00		| reg9: unused
+	.byte	0xFF		| reg10: HINT counter (off/max)
+	.byte	0x00		| reg11: ext interrupts off, full scroll
+	.byte	0x81		| reg12: H40, no shadow/highlight, no interlace
+	.byte	0x37		| reg13: hscroll table base = 0xDC00 (0x37<<10)
+	.byte	0x00		| reg14: unused
+	.byte	0x02		| reg15: autoincrement = 2 bytes
+	.byte	0x01		| reg16: plane size 64x32
+	.byte	0x00		| reg17: window H
+	.byte	0x00		| reg18: window V
+	.byte	0xFF		| reg19: DMA length lo (unused here)
+	.byte	0xFF		| reg20: DMA length hi
+	.byte	0x00		| reg21: DMA src lo
+	.byte	0x00		| reg22: DMA src mid
+	.byte	0x00		| reg23: DMA src hi/mode

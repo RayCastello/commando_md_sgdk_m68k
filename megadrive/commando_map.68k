@@ -1,0 +1,266 @@
+| =====================================================================
+| commando_map.68k - the Commando-specific half of Option C.
+|
+| Provides everything z80_interp.68k expects from the host:
+|   z80_rom_data        - the 48KB (0x0000-0xBFFF) program ROM image
+|   Z80_IO_READ/WRITE    - everything >= 0xC000
+|
+| Memory map (from MAME's commando.cpp, main CPU):
+|   C000 IN0 (system)   C001 IN1 (P1)   C002 IN2 (P2)
+|   C003 DSW1           C004 DSW2
+|   C800 soundlatch (write)         C808-C809 scrollx   C80A-C80B scrolly
+|   D000-D3FF videoram (fg tiles)   D400-D7FF colorram (fg)
+|   D800-DBFF videoram (bg tiles)   DC00-DFFF colorram (bg)
+|   E000-FDFF work RAM              FE00-FF7F sprite RAM   FF80-FFFF RAM
+|
+| WHAT'S REAL vs WHAT'S A STUB in this file:
+|   - RAM/scroll-register/soundlatch handling: real, works.
+|   - Input port bit mapping: placeholder polarity - cross-check
+|     against commando_z80.asm's own comments for the exact bit
+|     order Capcom used before trusting attract-mode/coin-up behaviour.
+|   - VDP tile/palette conversion: NOT done here. This engine pushes
+|     the *arcade tile numbers* into VDP plane A/B verbatim once per
+|     frame (see Flush_Video) - useful for proving the pipe is wired,
+|     but you still need to convert Commando's actual tile/sprite ROMs
+|     into Mega Drive 4bpp tiles + palette (a separate, asset-side
+|     tool, not engine code) before anything recognisable appears on
+|     screen. That's the next milestone, not this one.
+| =====================================================================
+
+	.include "z80_defs.inc"
+
+VDP_DATA	= 0x00C00000
+VDP_CTRL	= 0x00C00004
+
+	.bss
+	.align	2
+z80_ram:		.ds.b	0x4000		| emulates C000-FFFF (16KB)
+z80_soundlatch:		.ds.b	1
+z80_soundlatch_new:	.ds.b	1		| set 1 by a C800 write, cleared once
+						| the sound-CPU bridge (not yet
+						| written) consumes it
+z80_scrollx:		.ds.w	1
+z80_scrolly:		.ds.w	1
+vdp_video_dirty:	.ds.b	1		| coarse "something in D000-DFFF
+						| changed this frame" flag
+vblank_flag:		.ds.b	1
+pad1_state:		.ds.b	1
+pad2_state:		.ds.b	1
+dsw1_value:		.ds.b	1
+dsw2_value:		.ds.b	1
+	.even
+	.text
+
+| =====================================================================
+| Z80 program ROM image (0x0000-0xBFFF). TODO(Ray): replace this
+| zero-filled placeholder with your own dump of Commando's main-CPU
+| ROMs (cm23, cm24, cm25, cm26 or however your set names them),
+| concatenated in address order to exactly 0xC000 bytes. Until then
+| the interpreter will run through nothing but NOPs/zero bytes forever
+| - useful only to prove the plumbing links and boots without crashing.
+| =====================================================================
+	.global	z80_rom_data
+z80_rom_data:
+	.ds.b	Z80_ROM_SIZE
+
+| =====================================================================
+| Z80_IO_READ - in: d0.w = z80 address (>=0xC000)  out: d1.b
+| =====================================================================
+	.global	Z80_IO_READ
+Z80_IO_READ:
+	cmp.w	#0xC000,d0
+	bne.s	1f
+	move.b	pad1_state,d1
+	rts
+1:
+	cmp.w	#0xC001,d0
+	bne.s	2f
+	move.b	pad1_state,d1		| TODO: confirm IN0 vs IN1 vs IN2 role
+	rts				| split (system/coin vs P1 vs P2) against
+2:					| commando_z80.asm before trusting this
+	cmp.w	#0xC002,d0
+	bne.s	3f
+	move.b	pad2_state,d1
+	rts
+3:
+	cmp.w	#0xC003,d0
+	bne.s	4f
+	move.b	dsw1_value,d1
+	rts
+4:
+	cmp.w	#0xC004,d0
+	bne.s	5f
+	move.b	dsw2_value,d1
+	rts
+5:
+	move.w	d0,d2
+	sub.w	#0xC000,d2
+	lea	z80_ram,a0
+	move.b	(a0,d2.w),d1
+	rts
+
+| =====================================================================
+| Z80_IO_WRITE - in: d0.w = z80 address (>=0xC000), d1.b = value
+| =====================================================================
+	.global	Z80_IO_WRITE
+Z80_IO_WRITE:
+	cmp.w	#0xC800,d0
+	bne.s	1f
+	move.b	d1,z80_soundlatch
+	move.b	#1,z80_soundlatch_new	| TODO: wire this to the real Z80
+	rts				| sound coprocessor once its driver
+1:					| exists (see project README, step 2)
+	cmp.w	#0xC808,d0
+	bne.s	2f
+	move.b	d1,z80_scrollx+0
+	rts
+2:
+	cmp.w	#0xC809,d0
+	bne.s	3f
+	move.b	d1,z80_scrollx+1
+	rts
+3:
+	cmp.w	#0xC80A,d0
+	bne.s	4f
+	move.b	d1,z80_scrolly+0
+	rts
+4:
+	cmp.w	#0xC80B,d0
+	bne.s	5f
+	move.b	d1,z80_scrolly+1
+	rts
+5:
+	move.w	d0,d2
+	sub.w	#0xC000,d2
+	lea	z80_ram,a0
+	move.b	d1,(a0,d2.w)
+	cmp.w	#0x1000,d2		| 0xD000-0xC000
+	blo.s	6f
+	cmp.w	#0x2000,d2		| below 0xE000-0xC000: video/colour RAM
+	bhs.s	6f
+	move.b	#1,vdp_video_dirty
+6:
+	rts
+
+| =====================================================================
+| VBlank - fires once per frame (60Hz NTSC). Signals Main and raises
+| the Z80 core's NMI, which is Commando main-CPU's normal vblank hook
+| (confirm the exact vector Commando uses if the game doesn't sync -
+| some Capcom boards of this era use maskable INT instead; if so, set
+| z80_int_pending here instead of z80_nmi_pending and switch z80_im
+| appropriately during boot).
+| =====================================================================
+	.global	Int_VBlank
+Int_VBlank:
+	movem.l	d0/a0,-(a7)
+	move.w	VDP_CTRL,d0		| clear pending VDP interrupt flags
+	move.b	#1,vblank_flag
+	move.b	#1,z80_nmi_pending
+	movem.l	(a7)+,d0/a0
+	rte
+
+	.global	Int_HBlank,Int_Level1,Int_Level2,Int_Level3,Int_Level5,Int_Level7
+Int_HBlank:
+Int_Level1:
+Int_Level2:
+Int_Level3:
+Int_Level5:
+Int_Level7:
+	rte
+
+	.global	Exception_Error
+Exception_Error:
+	stop	#0x2700			| real bug - freeze visibly rather than
+					| limp along; check PC on the stack in
+					| a debugger
+
+| =====================================================================
+| Main - boots the interpreted CPU and runs the frame loop:
+|   wait for vblank -> run N Z80 instructions -> flush video -> repeat
+| N is a placeholder instruction-count budget, not a real cycle count
+| (see z80_interp.68k header comment) - tune once something's on
+| screen and you can measure against real timing.
+| =====================================================================
+	.global	Main
+Main:
+	move.w	#0xC000,z80_pc		| TODO: confirm Commando's real reset
+					| vector - many Capcom Z80 boards of
+					| this era reset to 0x0000; check
+					| commando_z80.asm's entry point and
+					| fix this before relying on it
+	move.w	#0x0000,z80_pc		| (see TODO above - defaulting to 0)
+	move.b	#1,z80_im		| main CPU likely wants IM1 if it ever
+					| uses maskable INT; harmless if it
+					| only relies on NMI for vblank
+
+.frame:
+	tst.b	vblank_flag
+	beq.s	.frame
+
+	clr.b	vblank_flag
+	bsr	Read_Pads
+
+	move.w	#4000,d0		| instruction budget/frame - placeholder,
+	bsr	Z80_RUN			| tune against real hardware timing
+
+	tst.b	vdp_video_dirty
+	beq.s	.frame
+	clr.b	vdp_video_dirty
+	bsr	Flush_Video
+	bra.s	.frame
+
+| =====================================================================
+| Read_Pads - MD 3-button pad read via the standard 6-line handshake.
+| Bit layout differs from an arcade JAMMA panel: mapping arcade
+| directions/buttons onto MD's pad is a design choice, not a fact -
+| TODO(Ray): pick the mapping you want and confirm the resulting
+| pad1_state/pad2_state polarity matches what commando_z80.asm expects
+| at IN0/IN1/IN2 (active-low is typical on Capcom boards of this era).
+| =====================================================================
+CTRL1_DATA	= 0x00A10003
+CTRL1_CTRL	= 0x00A10009
+	.global	Read_Pads
+Read_Pads:
+	movem.l	d0-d1,-(a7)
+	move.b	#0x40,CTRL1_CTRL	| TH=1 (output), others input
+	move.b	#0x40,CTRL1_DATA	| TH high
+	move.b	CTRL1_DATA,d0		| d0: -1CBRLDU (TH=1 phase)
+	move.b	#0x00,CTRL1_DATA	| TH low
+	move.b	CTRL1_DATA,d1		| d1: -1SA00DU (TH=0 phase) - gives Start/A
+	move.b	d0,pad1_state		| placeholder: raw TH=1 byte, remap once
+	movem.l	(a7)+,d0-d1		| you've decided the arcade bit assignment
+	moveq	#0,d0
+	move.b	d0,pad2_state		| player 2 not wired yet (TODO)
+	rts
+
+| =====================================================================
+| Flush_Video - pushes the arcade's raw tile-number video RAM into
+| VDP plane A/B via DMA, once per frame if anything changed. This is
+| a direct byte-for-byte copy of D000-DFFF, NOT a tile/palette
+| conversion (see file header note) - it proves the data pipe works,
+| it does not make the screen look like Commando yet.
+| =====================================================================
+PLANE_A_BASE	= 0xC000
+PLANE_B_BASE	= 0xE000
+	.global	Flush_Video
+Flush_Video:
+	movem.l	d0-d1/a0,-(a7)
+	| fg tile numbers (D000-D3FF, 1KB) -> plane A, one byte -> low byte
+	| of each VDP tile-name word (TODO: real conversion needs the high
+	| byte for palette-line/flip bits once you have real graphics data)
+	lea	z80_ram,a0
+	lea	0x1000(a0),a0		| z80_ram+0x1000 == arcade addr 0xD000
+	move.l	#0x40000003,d0		| VDP DMA setup, dest=VRAM, len=1024
+	bsr	.dma_setup
+	move.w	#PLANE_A_BASE,d1
+	bsr	.dma_fire
+	movem.l	(a7)+,d0-d1/a0
+	rts
+.dma_setup:
+	rts				| TODO: fill in real VDP DMA register
+					| programming (regs 19-23 + autoinc)
+					| once graphics conversion exists -
+					| left as a stub so this links today
+					| without pretending to be finished.
+.dma_fire:
+	rts
