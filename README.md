@@ -5,12 +5,10 @@
 - **`src/z80_interp.68k`** — o interpretador Z80, IDÊNTICO ao da versão raw-asm,
   só com um ajuste (`Z80_UNIMPL` agora retorna com `z80_trapped=1` em vez de
   travar o 68000 num loop infinito, pra você poder mostrar isso na tela via C).
-  **Continua montando limpo** com binutils genérico — testei aqui de novo.
+  **Continua montando limpo** com binutils genérico.
 - **`src/commando_io.c` / `commando_rom.c` / `main.c`** — reescritos em C
   usando API do SGDK (`JOY_readJoypad`, `SYS_doVBlankProcess`). Sintaxe
-  checada com gcc contra um `genesis.h` fake (pega erro de digitação, não
-  garante que a API bate 100% com a versão real do SGDK que você tem
-  instalada — não tenho o SGDK real neste sandbox pra compilar de verdade).
+  checada com gcc contra um `genesis.h` fake.
 - **`src/io_shim.68k`** — a peça nova e a única com risco real: adapta a
   convenção de registrador que o interpretador usa (`d0`/`d1`) pra uma
   chamada C normal (por pilha). **Esse é o primeiro lugar a olhar se o link
